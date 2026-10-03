@@ -39,18 +39,45 @@ function pipInstall(extraArgs) {
   });
 }
 
+// Compare two version strings of the form "1.2.3" with an optional suffix
+// (e.g. "1.2.3a1"). Returns -1, 0, or 1, or null when either side cannot be
+// parsed. A bare release sorts above the same numbers with a suffix.
+function compareVersions(a, b) {
+  const parts = (v) => {
+    const m = /^(\d+)\.(\d+)\.(\d+)(.*)$/.exec(v);
+    return m ? [Number(m[1]), Number(m[2]), Number(m[3]), m[4]] : null;
+  };
+  const pa = parts(a);
+  const pb = parts(b);
+  if (!pa || !pb) return null;
+  for (let i = 0; i < 3; i++) {
+    if (pa[i] !== pb[i]) return pa[i] < pb[i] ? -1 : 1;
+  }
+  if (pa[3] === pb[3]) return 0;
+  if (pa[3] === "") return 1;
+  if (pb[3] === "") return -1;
+  return pa[3] < pb[3] ? -1 : 1;
+}
+
 function main() {
   try {
     const have = installedVersion();
-    if (have === VERSION) {
-      console.log(
-        `taken ${VERSION} is already installed, skipping the pip install.`
-      );
-      return;
-    }
     if (have === null) {
       console.log(`Installing taken-gh ${VERSION} with pip...`);
     } else {
+      const cmp = compareVersions(have, VERSION);
+      if (cmp !== null && cmp > 0) {
+        console.log(
+          `taken ${have} is already installed, newer than this package's ${VERSION}; skipping the pip install.`
+        );
+        return;
+      }
+      if (cmp === 0) {
+        console.log(
+          `taken ${VERSION} is already installed, skipping the pip install.`
+        );
+        return;
+      }
       console.log(
         `Found taken ${have}, but this package needs ${VERSION}; reinstalling with pip...`
       );

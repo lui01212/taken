@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+title: taken
+version: 0.8.0
+authors:
+  - name: RogueAlg0
+    website: https://github.com/RogueAlg0
+license: MIT
+repository-code: https://github.com/RogueAlg0/taken
+message: If you use this software, please cite it as below.

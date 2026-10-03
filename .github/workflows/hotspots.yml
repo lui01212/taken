@@ -5,9 +5,12 @@ name: Hotspot badge refresh
 # every push to main; when the numbers changed, a refresh PR is opened. The
 # PR goes through the normal required checks like any other change.
 #
-# The auto-merge uses the HOTSPOT_MERGE_PAT secret (a fine-grained PAT), not
-# GITHUB_TOKEN: merges attributed to GITHUB_TOKEN do not trigger new workflow
-# runs, which left main's HEAD with no CI signal (#88).
+# The refresh-branch push and the auto-merge both use the HOTSPOT_MERGE_PAT
+# secret (a fine-grained PAT), not GITHUB_TOKEN: bot-attributed pushes
+# produce pull_request runs that fail immediately with zero jobs, so
+# required checks fail and auto-merge never fires (#361).
+# Merges attributed to GITHUB_TOKEN do not trigger new workflow runs, which
+# left main's HEAD with no CI signal (#88).
 
 permissions: {}
 
@@ -26,6 +29,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0 # full history: churn needs every commit
+          # The persisted credential below is what `git push` uses for the
+          # refresh branch; it must be the PAT (see header comment, #361).
+          token: ${{ secrets.HOTSPOT_MERGE_PAT }}
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.12"

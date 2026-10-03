@@ -130,6 +130,23 @@ def test_server_registers_three_tools():
     assert discover_properties["claim_silence_complex_days"]["default"] is None
 
 
+def test_check_issue_and_scan_repo_expose_decay_thresholds_in_schema():
+    # Issue #366: check_issue and scan_repo offer the same stale-claim
+    # decay knobs as discover_candidates, all optional, so old clients
+    # keep working unchanged.
+    async def go():
+        return await mcp.list_tools()
+
+    tools = asyncio.run(go())
+    schemas = {t.name: t.input_schema for t in tools}
+    discover = schemas["discover_candidates"]["properties"]
+    for tool in ("check_issue", "scan_repo"):
+        properties = schemas[tool]["properties"]
+        for name in ("pr_idle_days", "claim_silence_days", "claim_silence_complex_days"):
+            assert properties[name] == discover[name]
+    assert schemas["check_issue"]["required"] == ["owner", "repo", "issue_number"]
+
+
 def test_check_issue_go(faked):
     payload = check_issue("octo", "repo", 1)
     assert payload["target"] == "octo/repo#1"
@@ -170,7 +187,12 @@ def test_check_issue_carries_friendly_and_welcoming(monkeypatch):
 def test_scan_repo_reports_each_issue(faked):
     payload = scan_repo("octo", "repo", limit=10)
     assert payload["target"] == "octo/repo"
-    assert payload["effective_parameters"] == {"limit": 10, "label": None, "me": None}
+    assert payload["effective_parameters"] == {
+        "limit": 10,
+        "label": None,
+        "me": None,
+        "thresholds": checks.default_thresholds(),
+    }
     by_target = {r["target"]: r["verdict"] for r in payload["results"]}
     assert by_target == {
         "octo/repo#1": "GO",
@@ -185,6 +207,7 @@ def test_scan_repo_echoes_effective_default_parameters(faked):
         "limit": 20,
         "label": None,
         "me": None,
+        "thresholds": checks.default_thresholds(),
     }
 
 
@@ -210,6 +233,30 @@ def test_scan_repo_carries_friendly_and_welcoming(monkeypatch):
     assert result["welcoming"] == []  # no CONTRIBUTING.md in this fake
 
 
+def test_scan_repo_does_not_recompute_markers(monkeypatch, faked):
+    # Issue #46: _check_one already computes the markers, so scan_repo
+    # must reuse the payload fields instead of calling the helpers again.
+    # Thread-safe counters: _check_one runs on pool worker threads.
+    friendly_calls, welcoming_calls = [], []
+    real_friendly, real_welcoming = checks.friendly_labels, checks.welcoming_signals
+
+    def counting_friendly(findings):
+        friendly_calls.append(1)
+        return real_friendly(findings)
+
+    def counting_welcoming(findings):
+        welcoming_calls.append(1)
+        return real_welcoming(findings)
+
+    monkeypatch.setattr(checks, "friendly_labels", counting_friendly)
+    monkeypatch.setattr(checks, "welcoming_signals", counting_welcoming)
+    payload = scan_repo("octo", "repo", limit=10)
+    assert len(payload["results"]) == 3
+    # Once per issue inside _check_one; scan_repo itself adds none.
+    assert len(friendly_calls) == 3
+    assert len(welcoming_calls) == 3
+
+
 def test_scan_repo_error_dict(monkeypatch):
     def boom(endpoint, params=None):
         raise checks.TakenError("repo gone")
@@ -218,7 +265,12 @@ def test_scan_repo_error_dict(monkeypatch):
     payload = scan_repo("octo", "repo", limit=7, label="help wanted", me="octocat")
     assert payload == {
         "target": "octo/repo",
-        "effective_parameters": {"limit": 7, "label": "help wanted", "me": "octocat"},
+        "effective_parameters": {
+            "limit": 7,
+            "label": "help wanted",
+            "me": "octocat",
+            "thresholds": checks.default_thresholds(),
+        },
         "error": "repo gone",
         "error_code": "unknown",
     }
@@ -361,7 +413,9 @@ def test_check_issue_uses_graphql_when_authenticated(monkeypatch):
     seen = {}
     monkeypatch.setattr(checks, "_github_identity", lambda: "someone")
 
-    def fake(owner, repo, number, me=None, mode="rest", session=None, payload=None):
+    def fake(
+        owner, repo, number, me=None, mode="rest", session=None, payload=None, thresholds=None
+    ):
         seen["mode"] = mode
         return {"transport": mode}
 
@@ -376,7 +430,9 @@ def test_check_issue_uses_graphql_when_authenticated(monkeypatch):
 def test_check_issue_stays_rest_when_anonymous(monkeypatch):
     seen = {}
 
-    def fake(owner, repo, number, me=None, mode="rest", session=None, payload=None):
+    def fake(
+        owner, repo, number, me=None, mode="rest", session=None, payload=None, thresholds=None
+    ):
         seen["mode"] = mode
         return {"transport": mode}
 
@@ -391,7 +447,9 @@ def test_check_issue_explicit_flags_still_win(monkeypatch):
     seen = {}
     monkeypatch.setattr(checks, "_github_identity", lambda: "someone")
 
-    def fake(owner, repo, number, me=None, mode="rest", session=None, payload=None):
+    def fake(
+        owner, repo, number, me=None, mode="rest", session=None, payload=None, thresholds=None
+    ):
         seen["mode"] = mode
         return {"transport": mode}
 
@@ -418,11 +476,98 @@ def test_check_issue_graphql_fallback_is_surfaced(monkeypatch, faked):
     assert "transport down" in payload["findings"]["transport_fallback"]
 
 
+def test_check_issue_defaults_to_standard_decay_thresholds(faked):
+    payload = check_issue("octo", "repo", 1)
+    assert payload["findings"]["thresholds"] == checks.default_thresholds()
+
+
+def test_check_issue_threads_decay_thresholds_into_findings(faked):
+    payload = check_issue(
+        "octo",
+        "repo",
+        1,
+        pr_idle_days=30,
+        claim_silence_days=3,
+        claim_silence_complex_days=5,
+    )
+    assert payload["findings"]["thresholds"] == {
+        "pr_idle_days": 30,
+        "claim_silence_days": 3,
+        "claim_silence_complex_days": 5,
+    }
+
+
+def test_check_issue_threads_decay_thresholds_to_fetch(monkeypatch):
+    # The thresholds reach the fetch layer, so decide() sees the same
+    # values on every transport path (issue #366).
+    seen = {}
+
+    def fake(
+        owner, repo, number, me=None, mode="rest", session=None, payload=None, thresholds=None
+    ):
+        seen["thresholds"] = thresholds
+        return {"transport": mode}
+
+    monkeypatch.setattr(graphql, "run_checks_with_fallback", fake)
+    _stub_tool_output(monkeypatch)
+    check_issue("octo", "repo", 1, pr_idle_days=30, claim_silence_days=3)
+    assert seen["thresholds"] == {
+        "pr_idle_days": 30,
+        "claim_silence_days": 3,
+        "claim_silence_complex_days": 14,
+    }
+
+
+def test_scan_repo_threads_decay_thresholds_to_each_issue(monkeypatch):
+    seen = []
+
+    def fake(
+        owner, repo, number, me=None, mode="rest", session=None, payload=None, thresholds=None
+    ):
+        seen.append(thresholds)
+        return {"transport": mode}
+
+    monkeypatch.setattr(graphql, "run_checks_with_fallback", fake)
+
+    def fake_listing(owner, repo, limit=20, label=None):
+        return [{"number": 1}, {"number": 2}]
+
+    monkeypatch.setattr(checks, "list_open_issues", fake_listing)
+    _stub_tool_output(monkeypatch)
+    payload = scan_repo("octo", "repo", limit=2, pr_idle_days=30, claim_silence_days=3)
+    custom = {
+        "pr_idle_days": 30,
+        "claim_silence_days": 3,
+        "claim_silence_complex_days": 14,
+    }
+    assert len(seen) == 2
+    assert all(entry == custom for entry in seen)
+    assert payload["effective_parameters"]["thresholds"] == custom
+
+
+def test_scan_repo_echoes_custom_decay_thresholds(faked):
+    payload = scan_repo(
+        "octo",
+        "repo",
+        limit=10,
+        pr_idle_days=30,
+        claim_silence_days=3,
+        claim_silence_complex_days=5,
+    )
+    assert payload["effective_parameters"]["thresholds"] == {
+        "pr_idle_days": 30,
+        "claim_silence_days": 3,
+        "claim_silence_complex_days": 5,
+    }
+
+
 def test_scan_repo_resolves_mode_automatically(monkeypatch, faked):
     seen = []
     monkeypatch.setattr(checks, "_github_identity", lambda: "someone")
 
-    def fake(owner, repo, number, me=None, mode="rest", session=None, payload=None):
+    def fake(
+        owner, repo, number, me=None, mode="rest", session=None, payload=None, thresholds=None
+    ):
         seen.append(mode)
         return {"transport": mode}
 

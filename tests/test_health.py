@@ -324,8 +324,14 @@ def test_to_dict_keys(monkeypatch):
         "stale_prs",
         "stale_beginner_labels",
         "untriaged",
+        "comment_fetch_errors",
+        "comment_fetch_skipped",
+        "pr_scan_failed",
     }
     assert data["waiting_claims"][0]["claimant"] == "alice"
+    assert data["comment_fetch_errors"] == []
+    assert data["comment_fetch_skipped"] == []
+    assert data["pr_scan_failed"] is False
 
 
 def test_truncated_when_issue_limit_hit(monkeypatch):
@@ -333,6 +339,127 @@ def test_truncated_when_issue_limit_hit(monkeypatch):
     monkeypatch.setattr(checks, "gh_api", make_gh(issues))
     assert run(issues, options=HealthOptions(issue_limit=2)).truncated is True
     assert run(issues, options=HealthOptions(issue_limit=5)).truncated is False
+
+
+# Failure isolation (issue #331)
+
+
+def make_failing_gh(issues=(), comments_map=None, pulls=(), fail_comments=(), fail_pulls=False):
+    """Fake checks.gh_api that raises TakenError on chosen endpoints."""
+
+    def fake(endpoint, params=None):
+        params = params or {}
+        if params.get("page", "1") != "1":
+            return []
+        if endpoint.endswith("/comments"):
+            number = int(endpoint.split("/")[-2])
+            if number in fail_comments:
+                raise checks.TakenError("boom")
+            return list((comments_map or {}).get(number, []))
+        if endpoint == "repos/o/r/pulls":
+            if fail_pulls:
+                raise checks.TakenError("boom")
+            return list(pulls)
+        if endpoint == "repos/o/r/issues":
+            return list(issues)
+        raise AssertionError(f"unexpected endpoint {endpoint}")
+
+    return fake
+
+
+def test_comment_fetch_error_isolated_per_issue(monkeypatch):
+    """One bad comment fetch fails that issue closed; the report survives."""
+    issues = (
+        make_issue(1, 20, comment_count=1),
+        make_issue(2, 20, comment_count=1),
+        make_issue(3, 40, labels=["good first issue"], comment_count=2),
+    )
+    comments = {
+        1: [make_comment("alice", "please assign me", 20)],
+        3: [make_comment("carol", "looks fun", 40)],
+    }
+    monkeypatch.setattr(checks, "gh_api", make_failing_gh(issues, comments, fail_comments=(2,)))
+    report = run(issues, comments)
+    assert [c.number for c in report.waiting_claims] == [1]
+    assert report.comment_fetch_errors == [2]
+    # Label-fed sections never needed the comments: still complete.
+    assert [e.number for e in report.stale_beginner_labels] == [3]
+    text = health.format_health_human(report)
+    assert "comment fetch failed for 1 issue(s) (#2)" in text
+    data = health.health_to_dict(report)
+    assert data["comment_fetch_errors"] == [2]
+
+
+def test_zero_comment_issues_skip_fetch(monkeypatch):
+    """Issues whose listing shows zero comments never hit the comments API."""
+    issues = (
+        make_issue(1, 20, comment_count=0),
+        make_issue(2, 40, labels=["good first issue"], comment_count=0),
+    )
+
+    def no_comments_allowed(endpoint, params=None):
+        if endpoint.endswith("/comments"):
+            raise AssertionError("comment fetch must be skipped")
+        return make_gh(issues)(endpoint, params)
+
+    monkeypatch.setattr(checks, "gh_api", no_comments_allowed)
+    report = run(issues)
+    assert [e.number for e in report.untriaged] == [1]  # #2 carries a label
+    assert [e.number for e in report.stale_beginner_labels] == [2]
+    assert report.comment_fetch_errors == []
+
+
+def test_budget_exhaustion_skips_comment_fetches(monkeypatch):
+    """A spent budget degrades to listing-fed sections instead of dying."""
+    issues = (
+        make_issue(1, 20, comment_count=3),
+        make_issue(2, 40, labels=["good first issue"], comment_count=1),
+    )
+
+    def no_comments_allowed(endpoint, params=None):
+        if endpoint.endswith("/comments"):
+            raise AssertionError("budget guard must skip comment fetches")
+        return make_gh(issues)(endpoint, params)
+
+    monkeypatch.setattr(checks, "gh_api", no_comments_allowed)
+    monkeypatch.setattr(health, "_api_calls_used", lambda: 60)
+    report = run(issues)
+    assert report.comment_fetch_skipped == [1, 2]
+    assert report.comment_fetch_errors == []
+    # Listing-fed sections still built from the same data; comment-fed
+    # sections stay empty for skipped issues (fail-closed).
+    assert [e.number for e in report.stale_beginner_labels] == [2]
+    assert report.untriaged == []
+    assert report.waiting_claims == []
+    text = health.format_health_human(report)
+    assert "API budget nearly spent; skipped comment fetches for 2 issue(s)" in text
+    data = health.health_to_dict(report)
+    assert data["comment_fetch_skipped"] == [1, 2]
+
+
+def test_budget_guard_ignores_cache_warm_runs(monkeypatch):
+    """The guard counts real calls, so it stays quiet well under budget."""
+    issues = (make_issue(1, 20, comment_count=1),)
+    comments = {1: [make_comment("alice", "please assign me", 20)]}
+    monkeypatch.setattr(checks, "gh_api", make_gh(issues, comments))
+    monkeypatch.setattr(health, "_api_calls_used", lambda: 12)
+    report = run(issues, comments)
+    assert report.comment_fetch_skipped == []
+    assert [c.number for c in report.waiting_claims] == [1]
+
+
+def test_pr_scan_failure_degrades(monkeypatch):
+    """A failing PR scan loses the stale-PR section, not the report."""
+    issues = (make_issue(1, 20, comment_count=1),)
+    comments = {1: [make_comment("alice", "please assign me", 20)]}
+    monkeypatch.setattr(checks, "gh_api", make_failing_gh(issues, comments, fail_pulls=True))
+    report = run(issues, comments)
+    assert report.pr_scan_failed is True
+    assert report.stale_prs == []
+    assert [c.number for c in report.waiting_claims] == [1]
+    text = health.format_health_human(report)
+    assert "PR scan failed; stale PR data is unavailable" in text
+    assert health.health_to_dict(report)["pr_scan_failed"] is True
 
 
 def test_cli_health_flags():

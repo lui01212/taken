@@ -607,21 +607,99 @@ def _sweep_expired():
         pass
 
 
+_PROTECTED_ROOTS = {
+    "",
+    "/",
+    "/home",
+    "/Users",
+    "/root",
+    "/etc",
+    "/var",
+    "/tmp",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/private",
+    "/private/etc",
+    "/private/var",
+    "/private/tmp",
+    "/System",
+    "/Library",
+    "/Applications",
+    "/Volumes",
+    "/System/Volumes",
+    "/System/Volumes/Data",
+    "/System/Volumes/Data/home",
+    "/System/Volumes/Data/Users",
+    "/System/Volumes/Data/root",
+    "/System/Volumes/Data/private",
+}
+
+
 def _looks_like_taken_cache(cache_dir):
-    """Return True if every file under cache_dir looks like a taken cache file.
+    """Return True if cache_dir matches the exact taken cache structure.
 
     taken's on-disk cache contains only api_cache.json at the top level and
-    v2/<digest>.json entry files. If anything else is present, the directory
-    is not (only) a taken cache and must not be deleted wholesale.
+    v2/<digest>.json entry files directly under v2/. Temporary files created
+    during atomic writes (prefix '.cache-') under v2/ or at the root are also
+    tolerated.
+
+    Any unexpected file, unexpected subdirectory (including empty directories),
+    nested directory under v2/, or nested api_cache.json disqualifies the
+    directory. An arbitrary empty directory without taken cache artifacts
+    does not qualify.
     """
-    for root, _dirs, files in os.walk(cache_dir):
-        for name in files:
-            if name == "api_cache.json":
-                continue
-            if name.endswith(_CACHE_FILE_SUFFIX) and os.path.basename(root) == "v2":
-                continue
+    try:
+        if not os.path.isdir(cache_dir) or os.path.islink(cache_dir):
             return False
-    return True
+        root_entries = os.listdir(cache_dir)
+    except OSError:
+        return False
+
+    if not root_entries:
+        return False
+
+    has_cache_indicator = False
+
+    for name in root_entries:
+        path = os.path.join(cache_dir, name)
+        if name == "v2":
+            try:
+                if not os.path.isdir(path) or os.path.islink(path):
+                    return False
+                v2_entries = os.listdir(path)
+            except OSError:
+                return False
+            for v2_name in v2_entries:
+                v2_path = os.path.join(path, v2_name)
+                try:
+                    if os.path.isdir(v2_path) or os.path.islink(v2_path):
+                        return False
+                except OSError:
+                    return False
+                if v2_name == "api_cache.json":
+                    return False
+                if v2_name.endswith(_CACHE_FILE_SUFFIX) or v2_name.startswith(".cache-"):
+                    continue
+                return False
+            has_cache_indicator = True
+        elif name == "api_cache.json":
+            try:
+                if not os.path.isfile(path) or os.path.islink(path):
+                    return False
+            except OSError:
+                return False
+            has_cache_indicator = True
+        elif name.startswith(".cache-"):
+            try:
+                if not os.path.isfile(path) or os.path.islink(path):
+                    return False
+            except OSError:
+                return False
+        else:
+            return False
+
+    return has_cache_indicator
 
 
 def _is_cache_dir_safe(cache_dir):
@@ -634,22 +712,40 @@ def _is_cache_dir_safe(cache_dir):
     never cause unrelated directories to be deleted via shutil.rmtree().
     """
     try:
-        resolved = os.path.realpath(cache_dir)
+        raw_expanded = os.path.expanduser(cache_dir)
+        raw_abs = os.path.abspath(raw_expanded).rstrip(os.path.sep)
+        resolved = os.path.realpath(cache_dir).rstrip(os.path.sep)
     except (OSError, ValueError):
         return False
 
-    # Block the most dangerous cases — these directories should never be deleted.
-    if resolved in ("/", os.path.sep):
+    # Block root itself.
+    if (
+        not resolved
+        or resolved in ("/", os.path.sep)
+        or not raw_abs
+        or raw_abs in ("/", os.path.sep)
+    ):
         return False
-    if resolved == os.path.expanduser("~"):
+
+    # Block user home directory (raw and resolved).
+    try:
+        home_raw = os.path.abspath(os.path.expanduser("~")).rstrip(os.path.sep)
+        home_resolved = os.path.realpath(os.path.expanduser("~")).rstrip(os.path.sep)
+        if resolved in (home_raw, home_resolved) or raw_abs in (home_raw, home_resolved):
+            return False
+    except (OSError, ValueError):
         return False
-    # Also block /home itself (but not subdirectories like /home/user/src).
-    if resolved == "/home":
+
+    # Block protected system roots (checking both raw and resolved paths to handle
+    # firmlinks and symlinks).
+    if raw_abs in _PROTECTED_ROOTS or resolved in _PROTECTED_ROOTS:
         return False
 
     # Allow the default cache location and any explicitly set absolute path
     # that lives inside it.
-    default_cache = os.path.realpath(os.path.join(os.path.expanduser("~"), ".cache", "taken"))
+    default_cache = os.path.realpath(
+        os.path.join(os.path.expanduser("~"), ".cache", "taken")
+    ).rstrip(os.path.sep)
     if resolved == default_cache or resolved.startswith(default_cache + os.path.sep):
         return True
 
@@ -1090,19 +1186,42 @@ def check_timeline(owner, repo, number, pr_idle_days=None):
             gh_api(endpoint, {"per_page": "100", "page": str(page)}),
             endpoint,
         )
+        parsed_prs = []
         for event in batch:
             parsed = _timeline_event_pr(event, seen)
-            if parsed is None:
-                continue
-            pr_info = _timeline_pr_info(*parsed)
-            linked.append(pr_info)
-            if _is_taken_decisive(pr_info, pr_idle_days):
-                # TAKEN-decisive: decide() reports TAKEN on this PR alone.
-                # Note: truncated=True here is over-conservative when the
-                # decisive PR is the last item of a short final page (the
-                # scan was actually complete), but harmless: TAKEN outranks
-                # the CAUTION that truncation adds in decide().
-                return linked, True
+            if parsed is not None:
+                parsed_prs.append(parsed)
+        # Linked PRs are independent fetches, so authenticated callers
+        # fetch the page's PRs concurrently (issue #216); the anonymous
+        # tier keeps the exact sequential behavior. Futures are submitted
+        # up front and consumed in submission order, so linked-PR
+        # ordering, the decisive-PR early exit, and first-error semantics
+        # are identical either way.
+        workers = min(len(parsed_prs), budget.current().batch_workers)
+        if workers > 1:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [pool.submit(_timeline_pr_info, *p) for p in parsed_prs]
+                for future in futures:
+                    pr_info = future.result()
+                    linked.append(pr_info)
+                    if _is_taken_decisive(pr_info, pr_idle_days):
+                        # TAKEN-decisive: decide() reports TAKEN on this PR alone.
+                        # Note: truncated=True here is over-conservative when the
+                        # decisive PR is the last item of a short final page (the
+                        # scan was actually complete), but harmless: TAKEN outranks
+                        # the CAUTION that truncation adds in decide().
+                        return linked, True
+        else:
+            for parsed in parsed_prs:
+                pr_info = _timeline_pr_info(*parsed)
+                linked.append(pr_info)
+                if _is_taken_decisive(pr_info, pr_idle_days):
+                    # TAKEN-decisive: decide() reports TAKEN on this PR alone.
+                    # Note: truncated=True here is over-conservative when the
+                    # decisive PR is the last item of a short final page (the
+                    # scan was actually complete), but harmless: TAKEN outranks
+                    # the CAUTION that truncation adds in decide().
+                    return linked, True
         if len(batch) < 100:
             break
         if page == max_pages:
@@ -1386,11 +1505,27 @@ def _repo_push_info(owner, repo, window_days=HEALTH_WINDOW_DAYS):
     return pushed_at, pushed_recently
 
 
+def _page_stale(prs, cutoff):
+    """True when a full page's oldest `updated_at` falls below the cutoff.
+
+    Pages arrive `sort=updated desc`, so the oldest entry is last. A
+    missing or malformed `updated_at` fails closed (False) so paging
+    continues exactly as before.
+    """
+    oldest_updated = _parse_ts(prs[-1].get("updated_at"))
+    return oldest_updated is not None and oldest_updated < cutoff
+
+
 def _repo_recent_merges(owner, repo, cutoff, pulls_pages):
     """Count PRs merged since `cutoff`.
 
     Pages stay sequential with the early break on a short page, so the
     parallel health check issues exactly the calls the sequential one did.
+    A second early break fires when a full page's oldest `updated_at`
+    falls below the cutoff: pages are `sort=updated desc`, and every
+    merged PR satisfies `updated_at >= merged_at`, so no later page can
+    hold an in-window merge and the call is provably redundant
+    (issue #218).
     """
     recent_merges = 0
     for page in range(1, pulls_pages + 1):
@@ -1418,6 +1553,8 @@ def _repo_recent_merges(owner, repo, cutoff, pulls_pages):
             if merged_dt is not None and merged_dt >= cutoff:
                 recent_merges += 1
         if len(prs) < 50:
+            break
+        if _page_stale(prs, cutoff):
             break
     return recent_merges
 

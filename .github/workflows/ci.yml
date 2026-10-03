@@ -103,3 +103,15 @@ jobs:
               sys.exit(1)
           print(f"webshim version matches pyproject ({pkg})")
           EOF
+      - name: Check npm/package.json version matches pyproject version
+        run: |
+          python3 - <<'EOF'
+          import json, re, sys
+          pkg = re.search(r'^version = "(.*)"', open('pyproject.toml').read(), re.M).group(1)
+          npm = json.load(open('npm/package.json'))['version']
+          if npm != pkg:
+              print(f"::error::npm/package.json version ({npm}) does not match pyproject.toml ({pkg})")
+              print("Keep all version strings in sync: pyproject.toml, npm/package.json, docs/console/py/webshim.py.")
+              sys.exit(1)
+          print(f"npm/package.json version matches pyproject ({pkg})")
+          EOF

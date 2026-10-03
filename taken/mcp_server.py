@@ -33,7 +33,9 @@ from taken import __version__, budget, checks, discover, graphql
 from taken.verdict import decide
 
 
-def _check_one(owner, repo, number, me=None, mode=None, payload=None, session=None):
+def _check_one(
+    owner, repo, number, me=None, mode=None, payload=None, session=None, thresholds=None
+):
     """Run the full check suite on one issue; return the tool payload.
 
     ``mode`` selects the fetch path ("rest", "graphql", "persistent");
@@ -50,6 +52,9 @@ def _check_one(owner, repo, number, me=None, mode=None, payload=None, session=No
     mode with no session given, each calling thread gets its own session
     via graphql.thread_session(); the process-wide singleton is never
     shared across pool worker threads (issue #317).
+
+    `thresholds` carries the stale-claim decay settings (issue #83);
+    None means the defaults from checks.default_thresholds().
     """
     if mode is None:
         mode = graphql.fetch_mode()
@@ -58,7 +63,14 @@ def _check_one(owner, repo, number, me=None, mode=None, payload=None, session=No
         # thread its own session instead of the shared singleton.
         session = graphql.thread_session()
     findings = graphql.run_checks_with_fallback(
-        owner, repo, number, me=me, mode=mode, payload=payload, session=session
+        owner,
+        repo,
+        number,
+        me=me,
+        mode=mode,
+        payload=payload,
+        session=session,
+        thresholds=thresholds,
     )
     verdict, reasons = decide(findings)
     return {
@@ -100,6 +112,28 @@ def _error_payload(exc: Exception) -> dict[str, str]:
 _VERDICT_RANK = {"GO": 0, "CAUTION": 1, "TAKEN": 2}
 
 
+def _decay_thresholds(pr_idle_days=None, claim_silence_days=None, claim_silence_complex_days=None):
+    """Stale-claim decay settings (issue #83) shared by the three MCP tools.
+
+    Explicit values win; anything left None falls back to the checks
+    defaults, exactly like discover_candidates did before this helper
+    existed.
+    """
+    return {
+        "pr_idle_days": pr_idle_days if pr_idle_days is not None else checks.DEFAULT_PR_IDLE_DAYS,
+        "claim_silence_days": (
+            claim_silence_days
+            if claim_silence_days is not None
+            else checks.DEFAULT_CLAIM_SILENCE_DAYS
+        ),
+        "claim_silence_complex_days": (
+            claim_silence_complex_days
+            if claim_silence_complex_days is not None
+            else checks.DEFAULT_CLAIM_SILENCE_COMPLEX_DAYS
+        ),
+    }
+
+
 def check_issue(
     owner: str,
     repo: str,
@@ -116,6 +150,27 @@ def check_issue(
             "`gh auth token` held in memory only. Default: automatic from auth state."
         ),
     ] = False,
+    pr_idle_days: Annotated[
+        int | None,
+        Field(
+            description="Stale-claim decay: days of linked-PR inactivity before "
+            "TAKEN weakens to CAUTION. Default: 90."
+        ),
+    ] = None,
+    claim_silence_days: Annotated[
+        int | None,
+        Field(
+            description="Stale-claim decay: days one claim blocks as CAUTION on a "
+            "simple issue; the clock resets on claimant activity. Default: 7."
+        ),
+    ] = None,
+    claim_silence_complex_days: Annotated[
+        int | None,
+        Field(
+            description="Stale-claim decay: days one claim blocks as CAUTION on a "
+            "complex issue. Default: 14."
+        ),
+    ] = None,
 ) -> dict:
     """Check whether a GitHub issue is already taken.
 
@@ -139,6 +194,10 @@ def check_issue(
         me: your GitHub login; your own comments are ignored in the claimant scan
         graphql: force the GraphQL fetch path instead of the automatic choice
         persistent_session: force the persistent-session GraphQL path instead of the automatic one
+        pr_idle_days: stale-claim decay threshold for idle linked PRs (default 90)
+        claim_silence_days: stale-claim decay threshold for simple issues (default 7)
+        claim_silence_complex_days: stale-claim decay threshold for complex issues
+            (default 14)
     """
     # Explicit flags win; otherwise the transport is automatic from auth
     # state (GraphQL when logged in, REST when anonymous), like the CLI.
@@ -148,8 +207,9 @@ def check_issue(
         mode = "graphql"
     else:
         mode = None
+    thresholds = _decay_thresholds(pr_idle_days, claim_silence_days, claim_silence_complex_days)
     try:
-        return _check_one(owner, repo, issue_number, me=me, mode=mode)
+        return _check_one(owner, repo, issue_number, me=me, mode=mode, thresholds=thresholds)
     except (checks.TakenError, subprocess.TimeoutExpired) as exc:
         return {"target": f"{owner}/{repo}#{issue_number}", **_error_payload(exc)}
 
@@ -167,6 +227,27 @@ def scan_repo(
     me: Annotated[
         str | None,
         Field(description="Your GitHub login; your own comments are ignored. Default: none."),
+    ] = None,
+    pr_idle_days: Annotated[
+        int | None,
+        Field(
+            description="Stale-claim decay: days of linked-PR inactivity before "
+            "TAKEN weakens to CAUTION. Default: 90."
+        ),
+    ] = None,
+    claim_silence_days: Annotated[
+        int | None,
+        Field(
+            description="Stale-claim decay: days one claim blocks as CAUTION on a "
+            "simple issue; the clock resets on claimant activity. Default: 7."
+        ),
+    ] = None,
+    claim_silence_complex_days: Annotated[
+        int | None,
+        Field(
+            description="Stale-claim decay: days one claim blocks as CAUTION on a "
+            "complex issue. Default: 14."
+        ),
     ] = None,
 ) -> dict:
     """Scan a repository's open issues and recommend the GO ones.
@@ -189,8 +270,13 @@ def scan_repo(
         limit: max open issues to check (default 20)
         label: only consider open issues carrying this label
         me: your GitHub login; your own comments are ignored in the claimant scan
+        pr_idle_days: stale-claim decay threshold for idle linked PRs (default 90)
+        claim_silence_days: stale-claim decay threshold for simple issues (default 7)
+        claim_silence_complex_days: stale-claim decay threshold for complex issues
+            (default 14)
     """
-    effective_parameters = {"limit": limit, "label": label, "me": me}
+    thresholds = _decay_thresholds(pr_idle_days, claim_silence_days, claim_silence_complex_days)
+    effective_parameters = {"limit": limit, "label": label, "me": me, "thresholds": thresholds}
     try:
         issues = checks.list_open_issues(owner, repo, limit=limit, label=label)
     except (checks.TakenError, subprocess.TimeoutExpired) as exc:
@@ -209,7 +295,16 @@ def scan_repo(
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [
-            pool.submit(_check_one, owner, repo, item["number"], me=me, mode=mode, payload=item)
+            pool.submit(
+                _check_one,
+                owner,
+                repo,
+                item["number"],
+                me=me,
+                mode=mode,
+                payload=item,
+                thresholds=thresholds,
+            )
             for item in issues
         ]
         for item, future in zip(issues, futures, strict=True):
@@ -221,14 +316,15 @@ def scan_repo(
             except (checks.TakenError, subprocess.TimeoutExpired) as exc:
                 results.append({"target": f"{owner}/{repo}#{number}", **_error_payload(exc)})
                 continue
-            findings = payload["findings"]
+            # The _check_one payload already carries the markers; reuse
+            # them instead of recomputing (issue #46).
             results.append(
                 {
                     "target": payload["target"],
                     "verdict": payload["verdict"],
                     "reasons": payload["reasons"],
-                    "friendly_labels": checks.friendly_labels(findings),
-                    "welcoming": checks.welcoming_signals(findings),
+                    "friendly_labels": payload["friendly_labels"],
+                    "welcoming": payload["welcoming"],
                 }
             )
     results.sort(key=lambda r: _VERDICT_RANK.get(str(r.get("verdict") or ""), 3))
@@ -321,19 +417,7 @@ def discover_candidates(
         claim_silence_complex_days: stale-claim decay threshold for complex issues
             (default 14)
     """
-    thresholds = {
-        "pr_idle_days": pr_idle_days if pr_idle_days is not None else checks.DEFAULT_PR_IDLE_DAYS,
-        "claim_silence_days": (
-            claim_silence_days
-            if claim_silence_days is not None
-            else checks.DEFAULT_CLAIM_SILENCE_DAYS
-        ),
-        "claim_silence_complex_days": (
-            claim_silence_complex_days
-            if claim_silence_complex_days is not None
-            else checks.DEFAULT_CLAIM_SILENCE_COMPLEX_DAYS
-        ),
-    }
+    thresholds = _decay_thresholds(pr_idle_days, claim_silence_days, claim_silence_complex_days)
     effective_parameters = {
         "limit": limit,
         "language": language,

@@ -491,22 +491,31 @@ class _RollingVerifier:
         if self.bandit is not None:
             live = [r for r, q in self.repo_queues.items() if q]
             repo = self.bandit.pick(live)
-            idx = self.repo_queues[repo].popleft()
+            queue = self.repo_queues[repo]
         else:
-            idx = self.queue.popleft()
+            queue = self.queue
+        idx = queue.popleft()
         owner, repo, number, item = self.candidates[idx]
-        future = pool.submit(
-            _verify_candidate,
-            owner,
-            repo,
-            number,
-            item,
-            self.options.min_contributors,
-            self.options.me,
-            self.options.mode,
-            thresholds=self.options.thresholds,
-            repo_memo=self.repo_memo,
-        )
+        try:
+            future = pool.submit(
+                _verify_candidate,
+                owner,
+                repo,
+                number,
+                item,
+                self.options.min_contributors,
+                self.options.me,
+                self.options.mode,
+                thresholds=self.options.thresholds,
+                repo_memo=self.repo_memo,
+            )
+        except Exception:
+            # pool.submit can raise (e.g. RuntimeError from a closed
+            # executor during interpreter shutdown). The index is already
+            # popped, so restore it to the front of its queue: a candidate
+            # must never be silently lost (issue #335).
+            queue.appendleft(idx)
+            raise
         self.in_flight[future] = idx
         self.verified += 1
 

@@ -41,6 +41,7 @@ Run these three commands. CI runs the same ones:
 - `uv run ruff check`
 - `uv run ruff format --check`
 - `uv run pytest`
+- `uv run --frozen mypy taken/`
 
 ## Two gotchas
 

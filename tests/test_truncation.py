@@ -2,7 +2,7 @@
 never produce a silent GO. A truncated timeline or comment scan downgrades
 the verdict to CAUTION on both the REST and GraphQL fetch paths."""
 
-from taken import checks, graphql
+from taken import budget, checks, graphql
 from taken.verdict import CAUTION, GO, decide
 
 
@@ -224,3 +224,33 @@ def test_graphql_findings_flag_truncated_timeline(monkeypatch):
     verdict, reasons = decide(findings)
     assert verdict == CAUTION
     assert any("timeline scan stopped early" in r for r in reasons)
+
+
+def test_ten_full_timeline_pages_flag_truncation_when_authenticated(monkeypatch):
+    """In authenticated tier (cap=10), 10 full timeline pages flag truncation."""
+    budget.activate(identity="someone")
+    pages_seen = _quiet_run_checks_fake(monkeypatch, timeline_pages=10)
+    linked, truncated = checks.check_timeline("o", "r", 1)
+    assert linked == []
+    assert truncated is True
+    assert pages_seen["timeline"] == 10
+
+
+def test_ten_full_comment_pages_flag_truncation_when_authenticated(monkeypatch):
+    """In authenticated tier (cap=10), 10 full comment pages flag truncation."""
+    budget.activate(identity="someone")
+    pages_seen = _quiet_run_checks_fake(monkeypatch, comment_pages=10)
+    hits, _, truncated = checks.check_claimants("o", "r", 1)
+    assert hits == []
+    assert truncated is True
+    assert pages_seen["comments"] == 10
+
+
+def test_nine_full_pages_not_truncated_when_authenticated(monkeypatch):
+    """In authenticated tier (cap=10), 9 pages followed by an empty page is not truncated."""
+    budget.activate(identity="someone")
+    pages_seen = _quiet_run_checks_fake(monkeypatch, timeline_pages=9)
+    linked, truncated = checks.check_timeline("o", "r", 1)
+    assert linked == []
+    assert truncated is False
+    assert pages_seen["timeline"] == 10

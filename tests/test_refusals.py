@@ -1,6 +1,7 @@
 """Refusal-path tests: the tool must say no (or fail loudly) in the right way."""
 
 import base64
+from datetime import datetime, timedelta, timezone
 
 from test_verdict import base_findings
 
@@ -66,11 +67,16 @@ def test_empty_target_is_exit_3():
     assert main([""]) == 3
 
 
-def make_comment(author, body):
+def make_comment(author, body, days_ago=1):
+    # Relative date: a hardcoded created_at goes stale once the
+    # claim-silence window (7 days) passes and the test starts failing
+    # for everyone (seen Oct 2026). A fresh claim keeps the intent:
+    # the claimant was recently active.
+    created = (datetime.now(timezone.utc) - timedelta(days=days_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
     return {
         "user": {"login": author},
         "body": body,
-        "created_at": "2026-09-25T10:00:00Z",
+        "created_at": created,
         "html_url": "https://github.com/octo/repo/issues/1#issuecomment-1",
     }
 

@@ -45,6 +45,48 @@ describe("install.js", () => {
     assert.doesNotMatch(r.stdout + r.stderr, /pip should not have run/);
   });
 
+  it("skips pip when the installed taken is newer than the package", () => {
+    const dir = makeTempDir();
+    const [maj, min, pat] = PKG.version.split(".").map(Number);
+    const newer = `${maj}.${min}.${pat + 1}`;
+    writeExecutable(
+      dir,
+      "taken",
+      `#!/bin/sh\nif [ "$1" = "--version" ]; then echo "taken ${newer}"; exit 0; fi\nexit 1\n`
+    );
+    // A python3 that must never be called: it would fail loudly if invoked.
+    writeExecutable(dir, "python3", '#!/bin/sh\necho "pip should not have run" >&2\nexit 99\n');
+    const r = runInstall({ PATH: dir });
+    assert.equal(r.status, 0);
+    assert.match(
+      r.stdout,
+      new RegExp(`taken ${newer} is already installed, newer than this package's`)
+    );
+    assert.match(r.stdout, /skipping the pip install/);
+    assert.doesNotMatch(r.stdout + r.stderr, /pip should not have run/);
+  });
+
+  it("treats a prerelease suffix as older than the bare release", () => {
+    const dir = makeTempDir();
+    // taken reports "0.8.0a1" style output while the package is the bare
+    // release: the installed copy is older, so pip should run.
+    const marker = path.join(dir, "pip-args.txt");
+    writeExecutable(
+      dir,
+      "taken",
+      `#!/bin/sh\nif [ "$1" = "--version" ]; then echo "taken ${PKG.version}a1"; exit 0; fi\nexit 1\n`
+    );
+    writeExecutable(
+      dir,
+      "python3",
+      `#!/bin/sh\necho "$*" > "${marker}"\nexit 0\n`
+    );
+    const r = runInstall({ PATH: dir });
+    assert.equal(r.status, 0);
+    const args = fs.readFileSync(marker, "utf8").trim();
+    assert.equal(args, `-m pip install --user taken-gh==${PKG.version}`);
+  });
+
   it("runs pip when the installed taken version mismatches the package", () => {
     const dir = makeTempDir();
     writeExecutable(

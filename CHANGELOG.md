@@ -4,10 +4,18 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [Unreleased]
+## [0.8.0] - 2026-10-02
+
+### Security
+- Cache-directory validation hardened: protected system roots (such as `/`, `/home`, and `/tmp`) can never be selected for cache deletion, symlinks are rejected, and only the exact taken cache structure qualifies for cleanup (#356).
 
 ### Fixed
 - GraphQL subprocess failures with no stderr now report stdout or the exit status instead of an empty diagnostic (#343).
+
+### Changed
+- CONTRIBUTING.md pre-push checklist now includes the mypy step (#351).
+
+## [Unreleased]
 
 ## [0.7.5] - 2026-10-01
 

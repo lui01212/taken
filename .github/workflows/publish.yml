@@ -4,6 +4,14 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      npm_only_version:
+        description: >-
+          Version (X.Y.Z) to publish to npm only. Skips the PyPI, MCP
+          registry, and .deb jobs; they must already be done for this
+          version. Use only when the tag-triggered npm job could not run.
+        required: false
+        default: ""
 
 permissions:
   id-token: write
@@ -167,6 +175,59 @@ jobs:
           fi
           gh release upload "$TAG" "$DEB" --clobber
 
+  build-windows:
+    # One-file Windows executables for WinGet distribution. Built with
+    # PyInstaller on windows-latest so Windows users get a native
+    # taken.exe with no Python required. The zip is attached to the
+    # tag's GitHub Release alongside the .deb; the winget-pkgs manifest
+    # (packaging/winget/) points at it. See packaging/winget/README.md.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Install PyInstaller and taken
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install .
+      - name: Build one-file executables
+        # taken/__main__.py calls taken.cli:main; taken/mcp_server.py has a
+        # __main__ guard. No data files are bundled: the taken package is
+        # pure code and its runtime deps (tqdm, mcp) are pure Python.
+        run: |
+          pyinstaller --onefile --console --name taken taken/__main__.py
+          pyinstaller --onefile --console --name taken-mcp taken/mcp_server.py
+      - name: Smoke-test the executables
+        run: |
+          dist/taken.exe --version
+          dist/taken-mcp.exe < /dev/null || true
+      - name: Zip the executables
+        run: |
+          python - <<'EOF'
+          import os, zipfile
+          ver = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          name = f"taken_{ver}_windows-x64.zip"
+          with zipfile.ZipFile(name, "w", zipfile.ZIP_DEFLATED) as z:
+              z.write("dist/taken.exe", "taken.exe")
+              z.write("dist/taken-mcp.exe", "taken-mcp.exe")
+          print("wrote", name)
+          EOF
+      - name: Attach Windows zip to GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          ZIP="taken_${TAG#v}_windows-x64.zip"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "$TAG" --generate-notes
+          fi
+          gh release upload "$TAG" "$ZIP" --clobber
+
   npm:
     name: Publish npm installer (taken-gh)
     runs-on: ubuntu-latest
@@ -203,6 +264,79 @@ jobs:
         working-directory: npm
         # No NODE_AUTH_TOKEN on purpose: auth comes from the trusted
         # publisher configured on npmjs.com, exchanged via this job's
-        # id-token: write permission. Setting any token would make npm
+        # id-token. Anyone reusing this workflow file without that setup must
         # skip OIDC and fail.
         run: npm publish --access public --provenance
+
+  npm-only:
+    name: Publish npm installer only (manual recovery)
+    # Recovery path for when the tag-triggered npm job could not run
+    # (e.g. PyPI already had the version, so the normal publish job failed).
+    # No needs: this job must not depend on a fresh PyPI publish.
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.npm_only_version != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    # Serialize concurrent dispatches for the same version: the job's
+    # check-then-act (npm view, then publish) is not atomic, so two
+    # dispatches racing would both see the version absent and both
+    # publish, with npm rejecting the loser. Queued, not cancelled, so
+    # the second dispatch still runs and exits as the intended no-op.
+    # Tag-triggered publishes are unaffected: they do not use this job.
+    concurrency:
+      group: npm-only-${{ github.event.inputs.npm_only_version }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/v${{ github.event.inputs.npm_only_version }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          # Node 24 bundles npm >= 11.5.1, which supports OIDC trusted
+          # publishing, so no separate npm upgrade step is needed.
+          node-version: "24"
+      - name: Check the requested version is valid and ready
+        run: |
+          VER="${{ github.event.inputs.npm_only_version }}"
+          if ! printf '%s' "$VER" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "npm_only_version ($VER) is not a plain X.Y.Z version; refusing to publish."
+            exit 1
+          fi
+          NPM_VER=$(node -p "require('./npm/package.json').version")
+          if [ "$NPM_VER" != "$VER" ]; then
+            echo "npm/package.json version ($NPM_VER) does not match the requested version ($VER); refusing to publish."
+            exit 1
+          fi
+          # PyPI must already have this version: the npm postinstall step
+          # pip-installs taken-gh==$VER from PyPI.
+          for i in $(seq 1 10); do
+            if curl -sf "https://pypi.org/pypi/taken-gh/${VER}/json" -o /dev/null; then
+              echo "taken-gh ${VER} is live on PyPI"
+              exit 0
+            fi
+            echo "waiting for taken-gh ${VER} on PyPI (attempt $i/10)..."
+            sleep 20
+          done
+          echo "taken-gh ${VER} is not on PyPI; refusing to publish." >&2
+          exit 1
+      - name: Ensure npm supports OIDC trusted publishing
+        run: |
+          NPM_VER="$(npm --version)"
+          if [ "$(printf '%s\n%s\n' "11.5.1" "$NPM_VER" | sort -V | head -n 1)" != "11.5.1" ]; then
+            echo "npm $NPM_VER predates OIDC trusted publishing (needs >= 11.5.1); refusing to publish."
+            exit 1
+          fi
+      - name: Publish to npm
+        working-directory: npm
+        # No NODE_AUTH_TOKEN on purpose: auth comes from the trusted
+        # publisher configured on npmjs.com, exchanged via this job's
+        # id-token. Anyone reusing this workflow file without that setup must
+        # skip OIDC and fail.
+        run: |
+          VER="${{ github.event.inputs.npm_only_version }}"
+          if npm view "taken-gh@${VER}" version >/dev/null 2>&1; then
+            echo "taken-gh@${VER} is already published on npm; nothing to do."
+            exit 0
+          fi
+          npm publish --access public --provenance

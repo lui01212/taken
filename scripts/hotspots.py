@@ -7,11 +7,14 @@ summed per file (via radon); churn is the number of commits touching the file
 in git history.
 
 Usage:
-    python scripts/hotspots.py
+    python scripts/hotspots.py           # regenerate badge + print table
+    python scripts/hotspots.py --check   # read-only: print the table, exit 1
+                                         # if the badge file would change
 
 Regenerates docs/badges/hotspot.json (shields.io endpoint schema) and prints
 a ranked table to stdout. Needs `radon` installed and a full git history.
-Output is deterministic: sorted, no timestamps.
+Output is deterministic: sorted, no timestamps. Use --check for exploratory
+runs so looking at the table does not dirty the git tree.
 
 A file counts as a hotspot needing attention when it meets both thresholds
 below. Thresholds are documented here rather than tuned to look good; change
@@ -20,6 +23,7 @@ them with a normal PR if they stop being useful.
 
 from __future__ import annotations
 
+import argparse
 import json
 import subprocess
 import sys
@@ -42,7 +46,22 @@ def run(*args: str) -> str:
     return proc.stdout
 
 
-def main() -> int:
+def parse_args(argv: list[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Rank hotspot files (complexity x churn) and print the table. "
+        "Without flags, regenerates docs/badges/hotspot.json.",
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="read-only mode: print the table but never write the badge file; "
+        "exit 1 when the badge file would change, 0 when it is up to date",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     try:
         import radon  # noqa: F401  (imported for its CLI; version-agnostic)
     except ImportError:
@@ -108,16 +127,30 @@ def main() -> int:
             for r in flagged
         ],
     }
-    BADGE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    BADGE_PATH.write_text(json.dumps(badge, indent=2) + "\n")
+    rendered = json.dumps(badge, indent=2) + "\n"
 
     print(f"{'file':<28} {'cc':>6} {'commits':>8} {'hotspot':>9}  attention")
     for r in rows:
         mark = " <--" if r in flagged else ""
         print(f"{r['file']:<28} {r['cc']:>6} {r['commits']:>8} {r['hotspot']:>9}{mark}")
-    print(f"\nwrote {BADGE_PATH.relative_to(REPO_ROOT)}: {message} ({color})")
+
+    try:
+        badge_rel = BADGE_PATH.relative_to(REPO_ROOT)
+    except ValueError:
+        badge_rel = BADGE_PATH
+    if args.check:
+        current = BADGE_PATH.read_text() if BADGE_PATH.exists() else None
+        if current != rendered:
+            print(f"\ncheck: {badge_rel} would change (not written)")
+            return 1
+        print(f"\ncheck: {badge_rel} is up to date")
+        return 0
+
+    BADGE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    BADGE_PATH.write_text(rendered)
+    print(f"\nwrote {badge_rel}: {message} ({color})")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))

@@ -764,3 +764,78 @@ def test_verdict_parity_on_go_candidate(monkeypatch):
     }
     assert decide(findings) == decide(rest_findings)
     assert decide(findings)[0] == "GO"
+
+
+def test_gh_auth_token_timeout_becomes_taken_error():
+    with mock.patch.object(
+        subprocess,
+        "run",
+        side_effect=subprocess.TimeoutExpired(["gh", "auth", "token"], 30),
+    ):
+        with pytest.raises(checks.TakenError, match="timed out"):
+            graphql._gh_auth_token()
+
+
+def test_gh_auth_token_oserror_becomes_taken_error():
+    with mock.patch.object(subprocess, "run", side_effect=OSError("exec failed")):
+        with pytest.raises(checks.TakenError, match="could not run"):
+            graphql._gh_auth_token()
+
+
+def test_gh_auth_token_missing_gh_still_taken_error():
+    with mock.patch.object(subprocess, "run", side_effect=FileNotFoundError("gh")):
+        with pytest.raises(checks.TakenError, match="not installed"):
+            graphql._gh_auth_token()
+
+
+def test_get_session_singleton_under_concurrency(monkeypatch):
+    """Two threads racing first use must get one session, not two (#344)."""
+    import threading
+    import time
+
+    monkeypatch.setattr(graphql, "_SESSION", None)
+    constructed = []
+    real = graphql.PersistentGraphQLSession
+
+    def slow_ctor(*args, **kwargs):
+        time.sleep(0.02)  # widen the race window; the lock must still serialize
+        session = real(*args, **kwargs)
+        constructed.append(session)
+        return session
+
+    monkeypatch.setattr(graphql, "PersistentGraphQLSession", slow_ctor)
+    results = []
+
+    def fetch_session():
+        results.append(graphql.get_session())
+
+    threads = [threading.Thread(target=fetch_session) for _ in range(16)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert len(constructed) == 1
+    assert len(results) == 16
+    assert all(result is results[0] for result in results)
+
+
+def test_close_persistent_sessions_at_exit(monkeypatch):
+    fake = mock.Mock()
+    monkeypatch.setattr(graphql, "_SESSION", fake)
+    graphql._close_persistent_sessions()
+    fake.close.assert_called_once_with()
+    assert graphql._SESSION is None
+
+
+def test_close_persistent_sessions_at_exit_without_session(monkeypatch):
+    monkeypatch.setattr(graphql, "_SESSION", None)
+    graphql._close_persistent_sessions()  # must not raise
+    assert graphql._SESSION is None
+
+
+def test_close_persistent_sessions_at_exit_swallows_errors(monkeypatch):
+    fake = mock.Mock()
+    fake.close.side_effect = RuntimeError("shutdown chaos")
+    monkeypatch.setattr(graphql, "_SESSION", fake)
+    graphql._close_persistent_sessions()  # a traceback at exit would mask the real result
+    assert graphql._SESSION is None

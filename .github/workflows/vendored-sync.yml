@@ -1,0 +1,66 @@
+name: Vendored console copies auto-sync
+
+# docs/console/py/ carries byte-identical vendored copies of taken/checks.py,
+# taken/verdict.py and taken/budget.py, enforced by the docs-sync CI job.
+# In-house branches regularly change taken/*.py and forget the copies, so the
+# docs-sync check fails after the fact. This workflow prevents that failure:
+# on PR activity it re-copies the three files and pushes a fix commit to the
+# PR branch when (and only when) they drifted. The docs-sync job stays as the
+# backstop; this workflow just removes the human-memory step.
+#
+# The push uses HOTSPOT_MERGE_PAT, not GITHUB_TOKEN: pushes attributed to
+# github-actions[bot] produce pull_request runs that fail immediately with
+# zero jobs, so required checks fail (#361). Only in-house branches (head
+# repo == base repo) are touched, so contributor forks are never written to.
+
+permissions: {}
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    paths:
+      - "taken/checks.py"
+      - "taken/verdict.py"
+      - "taken/budget.py"
+
+# Serialise overlapping runs on the same PR: a stale run pushing after a
+# newer one would hit a non-fast-forward rejection and go red for no reason.
+concurrency:
+  group: vendored-sync-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    # Same-repo PRs only: never push to a contributor's fork.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Check out the PR head branch so the fix commit lands on it.
+          ref: ${{ github.event.pull_request.head.ref }}
+          # The persisted credential below is what `git push` uses; it must
+          # be the PAT (see header comment, #361).
+          token: ${{ secrets.HOTSPOT_MERGE_PAT }}
+      - name: Re-copy vendored files when they drifted
+        run: |
+          drift=0
+          for pair in "taken/checks.py docs/console/py/checks.py" "taken/verdict.py docs/console/py/verdict.py" "taken/budget.py docs/console/py/budget.py"; do
+            set -- $pair
+            if ! diff -q "$1" "$2" > /dev/null; then
+              echo "$2 is out of sync with $1, re-copying"
+              cp "$1" "$2"
+              drift=1
+            fi
+          done
+          if [ "$drift" -eq 0 ]; then
+            echo "vendored copies already in sync, nothing to do"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/console/py/checks.py docs/console/py/verdict.py docs/console/py/budget.py
+          git commit -m "docs: sync vendored console copies"
+          git push origin "HEAD:${{ github.event.pull_request.head.ref }}"

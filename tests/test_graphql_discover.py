@@ -110,5 +110,20 @@ def test_cli_discover_persistent_flag_plumbed(monkeypatch, capsys):
 
 def test_cli_discover_defaults_to_rest(monkeypatch, capsys):
     seen = _record_discover(monkeypatch)
+    monkeypatch.setattr(checks, "_github_identity", lambda: None)
     assert main(["--discover", "--label", "good first issue"]) == 0
+    assert seen["options"].mode == "rest"
+
+
+def test_cli_discover_defaults_to_graphql_when_authenticated(monkeypatch, capsys):
+    seen = _record_discover(monkeypatch)
+    monkeypatch.setattr(checks, "_github_identity", lambda: "someone")
+    assert main(["--discover", "--label", "good first issue"]) == 0
+    assert seen["options"].mode == "graphql"
+
+
+def test_cli_discover_rest_override_when_authenticated(monkeypatch, capsys):
+    seen = _record_discover(monkeypatch)
+    monkeypatch.setattr(checks, "_github_identity", lambda: "someone")
+    assert main(["--discover", "--rest", "--label", "good first issue"]) == 0
     assert seen["options"].mode == "rest"

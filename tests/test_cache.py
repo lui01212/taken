@@ -151,8 +151,22 @@ def test_clear_cache_flag_removes_dir(cache_env, counting_run, tmp_path, capsys)
 
 
 def test_clear_cache_flag_empty_cache(cache_env, tmp_path, capsys):
-    (tmp_path / "cache").mkdir()
+    cache_dir = tmp_path / "cache"
+    (cache_dir / "v2").mkdir(parents=True)
     assert cli.main(["--clear-cache"]) == 0
+    assert not cache_dir.exists()
+    assert "cleared 0 cache entries" in capsys.readouterr().out
+
+
+def test_clear_cache_flag_empty_default_cache(tmp_path, capsys, monkeypatch):
+    """Empty default cache directory (~/.cache/taken) is safely cleared."""
+    fake_home = tmp_path / "fake_home"
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.delenv("TAKEN_CACHE_DIR", raising=False)
+    default_cache = fake_home / ".cache" / "taken"
+    default_cache.mkdir(parents=True)
+    assert cli.main(["--clear-cache"]) == 0
+    assert not default_cache.exists()
     assert "cleared 0 cache entries" in capsys.readouterr().out
 
 
@@ -162,6 +176,8 @@ def test_clear_cache_flag_empty_cache(cache_env, tmp_path, capsys):
         "/",
         "~",
         "/home",
+        "/System/Volumes/Data/home",
+        "/Users",
         "/etc",
         "/tmp/evil",
         "relative/path",
@@ -170,6 +186,45 @@ def test_clear_cache_flag_empty_cache(cache_env, tmp_path, capsys):
 def test_clear_cache_rejects_unsafe_path(unsafe_path, capsys, monkeypatch):
     """--clear-cache must refuse to delete system directories."""
     monkeypatch.setenv("TAKEN_CACHE_DIR", unsafe_path)
+    assert cli.main(["--clear-cache"]) == 1
+    assert "not a safe path" in capsys.readouterr().err
+
+
+def test_clear_cache_rejects_empty_arbitrary_custom_dir(tmp_path, capsys, monkeypatch):
+    """An arbitrary empty custom directory not inside default cache must be rejected."""
+    empty_dir = tmp_path / "arbitrary_empty"
+    empty_dir.mkdir()
+    monkeypatch.setenv("TAKEN_CACHE_DIR", str(empty_dir))
+    assert cli.main(["--clear-cache"]) == 1
+    assert "not a safe path" in capsys.readouterr().err
+    assert empty_dir.exists()
+
+
+def test_clear_cache_rejects_symlink_to_system_root(tmp_path, capsys, monkeypatch):
+    """A symlink pointing to a protected system directory must be rejected."""
+    link = tmp_path / "link_to_system_root"
+    import os
+
+    target = "/home" if os.path.exists("/home") else "/etc"
+    try:
+        link.symlink_to(target)
+    except OSError:
+        pytest.skip("cannot create symlink")
+    monkeypatch.setenv("TAKEN_CACHE_DIR", str(link))
+    assert cli.main(["--clear-cache"]) == 1
+    assert "not a safe path" in capsys.readouterr().err
+
+
+def test_clear_cache_rejects_symlink_to_user_home(tmp_path, capsys, monkeypatch):
+    """A symlink pointing to user home directory must be rejected."""
+    import os
+
+    link = tmp_path / "link_to_user_home"
+    try:
+        link.symlink_to(os.path.expanduser("~"))
+    except OSError:
+        pytest.skip("cannot create symlink")
+    monkeypatch.setenv("TAKEN_CACHE_DIR", str(link))
     assert cli.main(["--clear-cache"]) == 1
     assert "not a safe path" in capsys.readouterr().err
 
@@ -198,6 +253,106 @@ def test_clear_cache_refuses_custom_dir_with_foreign_files(
     assert "not a safe path" in capsys.readouterr().err
     assert precious.exists()
     assert (cache_dir / "v2").is_dir()
+
+
+def test_clear_cache_rejects_unrelated_subdirectory_alongside_v2(tmp_path, capsys, monkeypatch):
+    """An empty unrelated subdirectory alongside v2/ must be rejected."""
+    cache_dir = tmp_path / "custom_cache"
+    (cache_dir / "v2").mkdir(parents=True)
+    unrelated = cache_dir / "unrelated"
+    unrelated.mkdir()
+    monkeypatch.setenv("TAKEN_CACHE_DIR", str(cache_dir))
+    assert cli.main(["--clear-cache"]) == 1
+    assert "not a safe path" in capsys.readouterr().err
+    assert cache_dir.exists()
+    assert (cache_dir / "v2").is_dir()
+    assert unrelated.is_dir()
+
+
+@pytest.mark.parametrize(
+    "subpath",
+    ["nested/api_cache.json", "v2/api_cache.json"],
+)
+def test_clear_cache_rejects_nested_api_cache_json(tmp_path, capsys, monkeypatch, subpath):
+    """api_cache.json is only permitted at the cache root, never in subdirectories."""
+    cache_dir = tmp_path / "custom_cache"
+    nested_file = cache_dir / subpath
+    nested_file.parent.mkdir(parents=True, exist_ok=True)
+    nested_file.write_text("{}")
+    monkeypatch.setenv("TAKEN_CACHE_DIR", str(cache_dir))
+    assert cli.main(["--clear-cache"]) == 1
+    assert "not a safe path" in capsys.readouterr().err
+    assert nested_file.exists()
+
+
+@pytest.mark.parametrize(
+    "subpath",
+    ["v2/v2", "nested/v2"],
+)
+def test_clear_cache_rejects_nested_v2_directory(tmp_path, capsys, monkeypatch, subpath):
+    """v2 directory is permitted only directly at cache root; nested v2 is rejected."""
+    cache_dir = tmp_path / "custom_cache"
+    nested_v2 = cache_dir / subpath
+    nested_v2.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("TAKEN_CACHE_DIR", str(cache_dir))
+    assert cli.main(["--clear-cache"]) == 1
+    assert "not a safe path" in capsys.readouterr().err
+    assert nested_v2.exists()
+
+
+@pytest.mark.parametrize(
+    "file_path",
+    ["unexpected.txt", "v2/unexpected.txt"],
+)
+def test_clear_cache_rejects_unexpected_non_json_files(tmp_path, capsys, monkeypatch, file_path):
+    """Unexpected non-JSON files at root or inside v2/ must be rejected."""
+    cache_dir = tmp_path / "custom_cache"
+    (cache_dir / "v2").mkdir(parents=True, exist_ok=True)
+    target = cache_dir / file_path
+    target.write_text("not json content")
+    monkeypatch.setenv("TAKEN_CACHE_DIR", str(cache_dir))
+    assert cli.main(["--clear-cache"]) == 1
+    assert "not a safe path" in capsys.readouterr().err
+    assert target.exists()
+
+
+def test_clear_cache_accepts_valid_root_api_cache_json(tmp_path, capsys, monkeypatch):
+    """A custom cache directory containing a valid root-level api_cache.json can be cleared."""
+    cache_dir = tmp_path / "custom_cache"
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "api_cache.json").write_text("{}")
+    monkeypatch.setenv("TAKEN_CACHE_DIR", str(cache_dir))
+    assert cli.main(["--clear-cache"]) == 0
+    assert not cache_dir.exists()
+    assert "cleared 1 cache entry" in capsys.readouterr().out
+
+
+def test_clear_cache_accepts_valid_root_v2_digest_json(tmp_path, capsys, monkeypatch):
+    """A custom cache directory with valid root-level v2/<digest>.json can be cleared."""
+    cache_dir = tmp_path / "custom_cache"
+    v2_dir = cache_dir / "v2"
+    v2_dir.mkdir(parents=True)
+    digest_filename = "abcd1234ef567890" * 4 + ".json"
+    (v2_dir / digest_filename).write_text("{}")
+    monkeypatch.setenv("TAKEN_CACHE_DIR", str(cache_dir))
+    assert cli.main(["--clear-cache"]) == 0
+    assert not cache_dir.exists()
+    assert "cleared 1 cache entry" in capsys.readouterr().out
+
+
+def test_clear_cache_accepts_valid_custom_cache_with_temp_files(tmp_path, capsys, monkeypatch):
+    """A valid custom cache directory with entry files and atomic write
+    temp files is safely cleared.
+    """
+    cache_dir = tmp_path / "custom_cache"
+    v2_dir = cache_dir / "v2"
+    v2_dir.mkdir(parents=True)
+    (v2_dir / "abcd1234ef567890.json").write_text("{}")
+    (v2_dir / ".cache-tmp12345").write_text("{}")
+    monkeypatch.setenv("TAKEN_CACHE_DIR", str(cache_dir))
+    assert cli.main(["--clear-cache"]) == 0
+    assert not cache_dir.exists()
+    assert "cleared 1 cache entry" in capsys.readouterr().out
 
 
 def test_cache_misses_after_identity_switch(monkeypatch, tmp_path):

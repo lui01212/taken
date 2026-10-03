@@ -16,6 +16,7 @@ escape hatch (``--rest`` / ``TAKEN_REST=1``) and as the automatic fallback
 when the GraphQL transport fails for a check.
 """
 
+import atexit
 import hashlib
 import http.client
 import json
@@ -279,7 +280,11 @@ def graphql_via_gh(query, variables):
 
 
 def _gh_auth_token():
-    """Read a token from `gh auth token`. Called once per session."""
+    """Read a token from `gh auth token`. Called once per session.
+
+    Raises TakenError (never a raw traceback) when `gh` is missing,
+    hangs, or cannot run.
+    """
     try:
         proc = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True, timeout=30)
     except FileNotFoundError:
@@ -287,6 +292,13 @@ def _gh_auth_token():
             "the `gh` CLI is not installed or not on PATH; "
             "the persistent session needs `gh auth token`"
         ) from None
+    except subprocess.TimeoutExpired:
+        raise checks.TakenError(
+            "`gh auth token` timed out after 30s; "
+            "the persistent session needs a responsive authenticated `gh`"
+        ) from None
+    except OSError as exc:
+        raise checks.TakenError(f"`gh auth token` could not run: {exc}") from None
     token = (proc.stdout or "").strip()
     if proc.returncode != 0 or not token:
         raise checks.TakenError(
@@ -425,14 +437,41 @@ class PersistentGraphQLSession:
 
 
 _SESSION: PersistentGraphQLSession | None = None
+_SESSION_LOCK = threading.Lock()
 
 
 def get_session():
-    """Process-wide persistent session, created on first use."""
+    """Process-wide persistent session, created once on first use.
+
+    Double-checked locking, the same pattern as budget.activate: two
+    threads racing first use get one session instead of two (the loser
+    would leak its keep-alive connection).
+    """
     global _SESSION
     if _SESSION is None:
-        _SESSION = PersistentGraphQLSession()
+        with _SESSION_LOCK:
+            if _SESSION is None:
+                _SESSION = PersistentGraphQLSession()
     return _SESSION
+
+
+def _close_persistent_sessions():
+    """Close the process-wide session at interpreter exit (atexit hook).
+
+    Keep-alive connections must not outlive the process and wait on GC.
+    Shutdown failures are swallowed: there is nothing useful to do with
+    them, and a traceback at exit would mask the real result.
+    """
+    global _SESSION
+    session, _SESSION = _SESSION, None
+    if session is not None:
+        try:
+            session.close()
+        except Exception:
+            pass
+
+
+atexit.register(_close_persistent_sessions)
 
 
 _thread_state = threading.local()

@@ -18,7 +18,7 @@ discover's maintainer-engagement heuristic).
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 
-from taken import checks
+from taken import budget, checks
 from taken.discover import MAINTAINER_ASSOCIATIONS
 from taken.verdict import age_phrase
 
@@ -26,6 +26,10 @@ DEFAULT_CLAIM_WAIT_DAYS = 7
 DEFAULT_PR_STALE_DAYS = 14
 DEFAULT_GFI_STALE_DAYS = 30
 DEFAULT_ISSUE_LIMIT = 100
+
+# How many real API calls below the hourly budget the per-issue comment
+# loop stops at, so the PR scan and any later sections still have room.
+HEALTH_BUDGET_RESERVE = 5
 
 # Beginner labels the stale-label scan watches (case-insensitive).
 BEGINNER_LABELS = frozenset({"good first issue", "good-first-issue", "hacktoberfest"})
@@ -105,6 +109,13 @@ class RepoHealth:
     stale_beginner_labels: list = field(default_factory=list)
     untriaged: list = field(default_factory=list)
     truncated: bool = False  # the issue listing hit issue_limit; more may exist
+    # Degradation accounting: comment fetch failures fail that issue
+    # closed (no claim/untriaged data for it) while the rest of the
+    # report keeps building; budget skips stop the comment loop early
+    # but leave every listing-fed section intact.
+    comment_fetch_errors: list = field(default_factory=list)  # issue numbers
+    comment_fetch_skipped: list = field(default_factory=list)  # issue numbers
+    pr_scan_failed: bool = False
 
     def summary(self):
         oldest = max((c.age_days for c in self.waiting_claims), default=None)
@@ -332,12 +343,35 @@ def _scan_untriaged(item, events, now):
     )
 
 
+def _api_calls_used():
+    """Real `gh api` calls made so far this run (cache hits excluded)."""
+    return sum(checks.api_stats_data()["calls"].values())
+
+
+def _comment_budget_spent():
+    """True when the hourly API budget is nearly spent.
+
+    The in-process counter only sees this run while the 60/hr tier is a
+    rolling window, so this is a conservative guard, not a guarantee:
+    GitHub's own rate-limit error still arrives as TakenError, which the
+    per-issue isolation turns into a degraded issue instead of a dead
+    report.
+    """
+    hourly = budget.current().hourly_requests
+    return _api_calls_used() >= max(hourly - HEALTH_BUDGET_RESERVE, 0)
+
+
 def repo_health(owner, repo, options=None, me=None, now=None):
     """Build the maintainer health report for a repo. Read-only.
 
     Fetches the open-issue listing once, then one comment listing per
-    issue (shared by the claim scan and the untriaged scan), plus the
-    open-PR listing. `me` excludes the invoker's own comments from the
+    issue with comments (shared by the claim scan and the untriaged
+    scan), plus the open-PR listing. Issues whose listing already shows
+    zero comments skip the fetch. A TakenError on one issue's comments
+    fails that issue closed without aborting the report, the way
+    _verify_candidate does per candidate. When the API budget is nearly
+    spent the comment loop stops early and the report says which issues
+    were skipped. `me` excludes the invoker's own comments from the
     claimant scan; `now` is a test override for the reference time.
     """
     options = options or HealthOptions()
@@ -349,8 +383,23 @@ def repo_health(owner, repo, options=None, me=None, now=None):
         truncated=len(issues) >= options.issue_limit,
     )
     for item in issues:
-        comments, _truncated = checks.fetch_comments(owner, repo, item["number"])
-        events = _comment_events(comments)
+        number = item["number"]
+        if _comment_budget_spent():
+            # Degrade gracefully: skip the remaining comment fetches but
+            # keep every section the listing alone can feed.
+            report.comment_fetch_skipped.append(number)
+            continue
+        if not item.get("comments"):
+            # The listing already says zero comments: no fetch needed.
+            events = []
+        else:
+            try:
+                comments, _truncated = checks.fetch_comments(owner, repo, number)
+            except checks.TakenError:
+                # Fail that issue closed; keep the rest of the report.
+                report.comment_fetch_errors.append(number)
+                continue
+            events = _comment_events(comments)
         waiting, quiet = _scan_issue_claims(item, events, options, me, now)
         report.waiting_claims.extend(waiting)
         report.quiet_claims.extend(quiet)
@@ -360,7 +409,11 @@ def repo_health(owner, repo, options=None, me=None, now=None):
     report.waiting_claims.sort(key=lambda c: -c.age_days)
     report.quiet_claims.sort(key=lambda c: -c.quiet_days)
     report.untriaged.sort(key=lambda e: -(e.age_days or 0))
-    report.stale_prs = _scan_prs(owner, repo, options, now)
+    try:
+        report.stale_prs = _scan_prs(owner, repo, options, now)
+    except checks.TakenError:
+        # The PR scan is one call chain: lose it, not the report.
+        report.pr_scan_failed = True
     report.stale_beginner_labels = _scan_beginner_labels(issues, options, now)
     return report
 
@@ -377,6 +430,9 @@ def health_to_dict(report):
         "stale_prs": [asdict(p) for p in report.stale_prs],
         "stale_beginner_labels": [asdict(e) for e in report.stale_beginner_labels],
         "untriaged": [asdict(e) for e in report.untriaged],
+        "comment_fetch_errors": list(report.comment_fetch_errors),
+        "comment_fetch_skipped": list(report.comment_fetch_skipped),
+        "pr_scan_failed": report.pr_scan_failed,
     }
 
 
@@ -397,6 +453,22 @@ def format_health_human(report):
     ]
     if report.truncated:
         lines.append("note: issue scan hit the listing cap; more issues may exist")
+        lines.append("")
+    if report.comment_fetch_errors:
+        nums = ", ".join(f"#{n}" for n in report.comment_fetch_errors)
+        lines.append(
+            f"note: comment fetch failed for {len(report.comment_fetch_errors)} "
+            f"issue(s) ({nums}); claim data for them is missing"
+        )
+        lines.append("")
+    if report.comment_fetch_skipped:
+        lines.append(
+            f"note: API budget nearly spent; skipped comment fetches for "
+            f"{len(report.comment_fetch_skipped)} issue(s)"
+        )
+        lines.append("")
+    if report.pr_scan_failed:
+        lines.append("note: PR scan failed; stale PR data is unavailable")
         lines.append("")
 
     def section(title, entries, render):
