@@ -17,7 +17,7 @@ def test_stale_claim_thresholds_reject_negative_values(flag, capsys):
     with pytest.raises(SystemExit) as exc_info:
         parser.parse_args([flag, "-1"])
 
-    assert exc_info.value.code == 2
+    assert exc_info.value.code == 3
     assert f"argument {flag}: must be non-negative" in capsys.readouterr().err
 
 

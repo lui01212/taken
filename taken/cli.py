@@ -61,6 +61,17 @@ def _probability(value):
     return number
 
 
+class _Parser(argparse.ArgumentParser):
+    """ArgumentParser whose usage errors exit 3, not argparse's default 2.
+
+    Exit 2 means CAUTION, so a usage error must not share it (#338).
+    """
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(3, f"{self.prog}: error: {message}\n")
+
+
 def build_parser():
     """Build and return the argument parser for the taken CLI.
 
@@ -70,7 +81,7 @@ def build_parser():
     reports (--health), cache management, output formatting (--json, --verbose,
     --debug), and stale-claim decay thresholds.
     """
-    parser = argparse.ArgumentParser(
+    parser = _Parser(
         prog="taken",
         description="Check whether a GitHub issue is already taken before you volunteer for it.",
     )

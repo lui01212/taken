@@ -107,7 +107,7 @@ def test_missing_file_is_exit_3(capsys):
     assert "cannot read" in capsys.readouterr().err
 
 
-def test_no_targets_is_argparse_error(capsys):
+def test_no_targets_is_usage_error(capsys):
     with pytest.raises(SystemExit) as exc:
         main([])
-    assert exc.value.code == 2
+    assert exc.value.code == 3

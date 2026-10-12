@@ -17,6 +17,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed
+- Every CLI usage error now exits 3, as documented. Misused flags such as
+  `--discover` with targets, `--health` with `--file` or the wrong number of
+  targets, a missing target, an unknown flag, or a rejected flag value used to
+  exit 2, which is the CAUTION code (#338).
+
 ## [0.9.1] - 2026-10-11
 
 ### Fixed

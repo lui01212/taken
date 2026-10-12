@@ -34,7 +34,7 @@ def test_count_flags_reject_negative_values(flag, capsys):
     with pytest.raises(SystemExit) as exc_info:
         parser.parse_args([flag, "-5"])
 
-    assert exc_info.value.code == 2
+    assert exc_info.value.code == 3
     assert f"argument {flag}: must be non-negative" in capsys.readouterr().err
 
 
@@ -51,7 +51,7 @@ def test_explore_floor_rejects_values_outside_zero_to_one(value, capsys):
     with pytest.raises(SystemExit) as exc_info:
         parser.parse_args(["--explore-floor", value])
 
-    assert exc_info.value.code == 2
+    assert exc_info.value.code == 3
     assert "argument --explore-floor: must be between 0 and 1" in capsys.readouterr().err
 
 
