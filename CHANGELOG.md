@@ -11,6 +11,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   transport.py copy that checks.py imports, and webshim.py sets __version__
   on the synthesized taken package. The docs-sync CI job and the
   vendored-sync workflow now cover transport.py.
+- Every usage error now exits 3, as the exit-code table says. Bad flags or
+  values, a missing target, `--discover` with targets and `--health` with
+  `--file` or several targets used to exit 2 through argparse, which is the
+  CAUTION verdict (#338).
 
 ## [0.9.2] - 2026-10-13
 

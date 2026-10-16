@@ -70,7 +70,7 @@ The claimant scan is a heuristic over comment text, not proof. The verdict
 always prints its evidence so you can judge for yourself.
 
 Exit codes: 0 means GO, 1 means TAKEN, 2 means CAUTION, 3 means something
-broke (bad target, no `gh`, API error).
+broke (bad target or flag, no `gh`, API error).
 
 ## Examples
 

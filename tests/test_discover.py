@@ -205,7 +205,7 @@ def test_discover_uses_single_ord_label_search(monkeypatch, capsys):
 def test_discover_with_targets_is_error(capsys):
     with pytest.raises(SystemExit) as exc:
         main(["--discover", "octo/repo#1"])
-    assert exc.value.code == 2
+    assert exc.value.code == 3
 
 
 def test_build_query():
@@ -402,7 +402,7 @@ def test_discover_cli_rejects_negative_limit(capsys):
     # A negative --limit used to exit 0 with "no candidates" (issue #339).
     with pytest.raises(SystemExit) as exc_info:
         main(["--discover", "--label", "good first issue", "--limit", "-1"])
-    assert exc_info.value.code == 2
+    assert exc_info.value.code == 3
     assert "argument --limit: must be non-negative" in capsys.readouterr().err
 
 
